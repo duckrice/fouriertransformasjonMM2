@@ -785,7 +785,7 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = tk.Tk(className="Spectrogram")  # window class, so the desktop can match its menu entry and icon
     app = App(root)
     if len(sys.argv) > 1:
         app.open_file(sys.argv[1])
