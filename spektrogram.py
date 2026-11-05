@@ -399,6 +399,29 @@ def plot_spectrogram(ax, spec, top, db_range):
     return image
 
 
+def spectrum_peaks(column, limit=12):
+    """Bins k that are higher than both neighbours and above 8 % of the top, strongest first."""
+    peaks = [k for k in range(1, len(column) - 1)
+             if column[k] > column[k - 1] and column[k] >= column[k + 1] and column[k] > 0.08 * column.max()]
+    # shortcut: only the 12 strongest get a label, so a sawtooth's many overtones don't pile up
+    return sorted(peaks, key=lambda k: -column[k])[:limit]
+
+
+def plot_spectrum(ax, spec, m, top, peak_colour, comma=False):
+    """Slice m of the spectrogram: one stem per frequency point f_k = k·rate/N, the peaks labelled in Hz."""
+    times, freqs, amps = spec
+    column = amps[:, m] / max(amps[:, m].max(), 1e-12)
+    stem = matplotlib.rcParams["xtick.color"]
+    ax.vlines(freqs, 0, column, color=stem, lw=0.8)
+    ax.plot(freqs, column, "o", ms=1.5, color=stem)
+    for k in spectrum_peaks(column):
+        label = f"{freqs[k]:.1f} Hz"
+        ax.plot(freqs[k], column[k], "o", ms=4, color=peak_colour)
+        ax.annotate(label.replace(".", ",") if comma else label, (freqs[k], column[k]), textcoords="offset points",
+                    xytext=(0, 5), ha="center", fontsize=8)
+    ax.set(xlim=(0, top), ylim=(0, 1.15), xlabel="Frequency (Hz)", ylabel="Relative amplitude")
+
+
 class ZoomBar(NavigationToolbar2Tk):
     """matplotlib's toolbar with only Home, Pan and Zoom. Back/Forward are greyed out most of the time and Tk
     draws a greyed-out icon as a grey block on a dark background; saving is in the File menu (Ctrl+S)."""
@@ -415,7 +438,8 @@ class App:
         self.sound_no = 0
         self.job = 0  # bumps on every new spectrogram, so a slow old one can't overwrite a newer result
         self.results = queue.Queue()
-        self.name = self.rate = self.signal = self.spec = self.ax = None
+        self.name = self.rate = self.signal = self.spec = self.ax = self.ax_spec = None
+        self.slice_time = None  # time (s) of the slice shown in the spectrum; None = the loudest one
         self.spec_frame = None  # slice length the shown spectrogram was made with
         self.zoomed_sound = None  # the sound whose zoom the graph shows; a new sound starts unzoomed
         self.recorder = Recorder()
@@ -444,6 +468,8 @@ class App:
         file.add_separator()
         file.add_command(label="Copy spectrogram", accelerator="Ctrl+C", command=self.copy_spectrogram)
         file.add_command(label="Save spectrogram for report…", accelerator="Ctrl+S", command=self.save_spectrogram)
+        file.add_command(label="Copy spectrum", command=lambda: self.copy_spectrogram(self.save_spectrum_to))
+        file.add_command(label="Save spectrum for report…", command=self.save_spectrum)
         file.add_command(label="Save sound as WAV…", command=self.save_sound)
         file.add_separator()
         file.add_command(label="Exit", command=self.root.destroy)
@@ -523,6 +549,7 @@ class App:
         self.on_frame_move()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.mpl_connect("motion_notify_event", self.on_move)
+        self.canvas.mpl_connect("button_press_event", self.on_click)
 
         # Start screen, shown over the graph until there is a sound.
         self.welcome = ttk.Frame(graphs, padding=16)
@@ -621,7 +648,7 @@ class App:
     def load(self, name, rate, signal):
         self.name, self.rate = name, rate
         self.signal = signal - signal.mean()  # remove the 0 Hz offset some microphones have
-        self.spec = None
+        self.spec = self.slice_time = None
         self.root.title(f"{name} – Spectrogram")
         self.on_frame_move()
         self.make_spectrogram()
@@ -677,20 +704,31 @@ class App:
         self.zoomed_sound = None
         self.fig.clear()
         self.fig.set_facecolor(matplotlib.rcParams["figure.facecolor"])
-        self.ax = None
+        self.ax = self.ax_spec = None
         if self.signal is None:
             self.welcome.place(relx=0.5, rely=0.45, anchor="center")
             self.canvas.draw_idle()
             return
         self.welcome.place_forget()
-        self.ax = self.fig.add_subplot()
-        self.ax.set_title(self.name, loc="left", fontsize=10)
         if self.spec is None:
+            self.ax = self.fig.add_subplot()
             self.ax.text(0.5, 0.5, "Working…", transform=self.ax.transAxes, ha="center",
                          color=matplotlib.rcParams["xtick.color"])
         else:
-            image = plot_spectrogram(self.ax, self.spec, min(TOP_HZ, self.rate / 2), self.db_range())
+            grid = self.fig.add_gridspec(2, 1, height_ratios=[2, 1])
+            self.ax, self.ax_spec = self.fig.add_subplot(grid[0]), self.fig.add_subplot(grid[1])
+            top = min(TOP_HZ, self.rate / 2)
+            image = plot_spectrogram(self.ax, self.spec, top, self.db_range())
             self.fig.colorbar(image, ax=self.ax, label="Loudness (dB)", pad=0.02)
+            m = self.slice_index()
+            accent = PALETTE["dark" if self.dark.get() else "light"]["accent"]
+            self.ax.axvline(self.spec[0][m], color=accent, lw=1, ls="--")
+            plot_spectrum(self.ax_spec, self.spec, m, top, accent)
+            self.ax_spec.set_title(f"Spectrum of slice m={m} at {self.spec[0][m]:.2f} s (N = {self.spec_frame})"
+                                   "  ·  click the spectrogram to pick another time", loc="left", fontsize=9)
+            # The spectrum's frequency axis follows the spectrogram's zoom.
+            self.ax.callbacks.connect("ylim_changed", lambda ax: self.ax_spec.set_xlim(ax.get_ylim()))
+        self.ax.set_title(self.name, loc="left", fontsize=10)
         self.ax.set_xlim(0, len(self.signal) / self.rate)
         self.fig.tight_layout()
         self.toolbar.update()  # forget the old graph's zoom history...
@@ -710,8 +748,26 @@ class App:
             db = 20 * np.log10(amps[k, m] / amps.max() + 1e-12)
             self.readout.set(f"slice m={m} ({times[m]:.2f} s) · bin k={k}: {freqs[k]:.1f} ± {freqs[1] / 2:.1f} Hz"
                              f" · {note_name(freqs[k])} · {db:.0f} dB")
+        elif event.inaxes is self.ax_spec and self.ax_spec is not None and event.xdata is not None:
+            times, freqs, amps = self.spec
+            m = self.slice_index()
+            k = min(max(round(event.xdata / freqs[1]), 1), len(freqs) - 1)
+            self.readout.set(f"slice m={m} · bin k={k}: {freqs[k]:.1f} ± {freqs[1] / 2:.1f} Hz · {note_name(freqs[k])}"
+                             f" · {amps[k, m] / max(amps[:, m].max(), 1e-12):.2f} of the slice's top")
         else:
             self.readout.set("")
+
+    def slice_index(self):
+        """The slice shown in the spectrum: nearest the clicked time, or the loudest one before any click."""
+        times, _, amps = self.spec
+        if self.slice_time is None:
+            return int(np.argmax(amps.sum(axis=0)))
+        return int(np.argmin(np.abs(times - self.slice_time)))
+
+    def on_click(self, event):
+        if event.inaxes is self.ax and self.spec is not None and event.xdata is not None and not self.toolbar.mode:
+            self.slice_time = event.xdata  # a time, not an index, so it survives a new slice length
+            self.draw()
 
     # ---------- sound ----------
     def play_sound(self):
@@ -757,12 +813,33 @@ class App:
             self.save_spectrogram_to(Path(path))
             self.status.set(f"Saved {Path(path).name} (white, Norwegian labels, the part you're zoomed in on).")
 
-    def copy_spectrogram(self):
+    def save_spectrum(self):
+        if self.spec is None:
+            return
+        m = self.slice_index()
+        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf"), ("PNG image", "*.png")],
+                                            initialfile=f"{self.stem()}_spekter_{self.spec[0][m]:.2f}s.pdf")
+        if path:
+            self.save_spectrum_to(Path(path))
+            self.status.set(f"Saved {Path(path).name}: slice m={m} at {self.spec[0][m]:.2f} s, N = {self.spec_frame}.")
+
+    def save_spectrum_to(self, path, **savefig_options):
+        """The spectrum of the chosen slice for the report: white, Norwegian labels, decimal commas."""
+        with matplotlib.rc_context({**mpl_style(dark=False, report=True), "figure.facecolor": "white",
+                                    "savefig.facecolor": "white"}):
+            fig = Figure(figsize=(6.5, 3.0))
+            ax = fig.add_subplot()
+            plot_spectrum(ax, self.spec, self.slice_index(), TOP_HZ, "#c0392b", comma=True)
+            ax.set(xlim=self.ax_spec.get_xlim(), xlabel="Frekvens (Hz)", ylabel="Relativ amplitude")
+            fig.tight_layout()
+            fig.savefig(path, dpi=200, **savefig_options)
+
+    def copy_spectrogram(self, save=None):
         """Put the shown area on the clipboard as a PNG image, ready to paste (Wayland: wl-copy, X11: xclip)."""
         if self.spec is None:
             return
         image = io.BytesIO()
-        self.save_spectrogram_to(image, format="png")
+        (save or self.save_spectrogram_to)(image, format="png")
         program = find_program("wl-copy", "xclip")
         if program is None:
             messagebox.showerror("Can't copy", "Copying images needs wl-copy (Wayland) or xclip (X11). "
