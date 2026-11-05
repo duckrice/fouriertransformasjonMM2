@@ -702,8 +702,14 @@ class App:
         self.canvas.draw_idle()
 
     def on_move(self, event):
-        if event.inaxes is self.ax and self.ax is not None and event.ydata is not None and event.ydata > 0:
-            self.readout.set(f"{event.xdata:.2f} s · {event.ydata:.1f} Hz · {note_name(event.ydata)}")
+        if event.inaxes is self.ax and self.ax is not None and event.ydata is not None and self.spec is not None:
+            # Snap to the tile under the cursor: show what the STFT computed there, not the mouse position.
+            times, freqs, amps = self.spec
+            k = min(max(round(event.ydata / freqs[1]), 1), len(freqs) - 1)
+            m = int(np.argmin(np.abs(times - event.xdata)))
+            db = 20 * np.log10(amps[k, m] / amps.max() + 1e-12)
+            self.readout.set(f"slice m={m} ({times[m]:.2f} s) · bin k={k}: {freqs[k]:.1f} ± {freqs[1] / 2:.1f} Hz"
+                             f" · {note_name(freqs[k])} · {db:.0f} dB")
         else:
             self.readout.set("")
 
